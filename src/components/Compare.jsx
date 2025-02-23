@@ -1,6 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { OpenSheetMusicDisplay } from 'opensheetmusicdisplay';
-import { ReactMic } from 'react-mic';
 import * as Pitchy from 'pitchy';
 
 const CompareMusicXMLWithAudio = () => {
@@ -17,9 +16,12 @@ const CompareMusicXMLWithAudio = () => {
     const intervalRef = useRef(null);
     const [isComparing, setIsComparing] = useState(false);
     const audioContextRef = useRef(new (window.AudioContext || window.webkitAudioContext)());
-
-    // New State to track transition complete
     const [transitionComplete, setTransitionComplete] = useState(false);
+    const [realTimePitches, setRealTimePitches] = useState([]);
+    const [micStream, setMicStream] = useState(null);
+    const pitchAnalyserRef = useRef(null);
+    const animationCallbackRef = useRef(null); // useRef to hold the animation callback
+    const recordedPitchesRef = useRef([]);  // Ref to hold pitches
 
     // Function to handle MusicXML file change
     const handleMusicXMLChange = (event) => {
@@ -35,62 +37,59 @@ const CompareMusicXMLWithAudio = () => {
     };
 
     // Effect to initialize and update OSMD
-  useEffect(() => {
-    const loadMusicXML = async (xmlContent) => {
-        if (!xmlContent || !osmdContainerRef.current) return;
+    useEffect(() => {
+        const loadMusicXML = async (xmlContent) => {
+            if (!xmlContent || !osmdContainerRef.current) return;
 
-        setLoading(true);
+            setLoading(true);
 
-        try {
-            // Dispose of the old OSMD instance if it exists
+            try {
+                // Dispose of the old OSMD instance if it exists
+                if (osmdRef.current) {
+                    stopAnimation();
+                    osmdRef.current.clear();
+                    osmdRef.current = null;
+                }
+
+                // Initialize OSMD
+                const osmd = new OpenSheetMusicDisplay(osmdContainerRef.current, {
+                    backend: 'svg',
+                    drawTitle: false,
+                    drawPartNames: false,
+                });
+
+                osmdRef.current = osmd;
+
+                await osmd.load(xmlContent);
+                await osmd.render();
+
+                // Extract tempo from MusicXML
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(xmlContent, 'text/xml');
+                const tempoElement = xmlDoc.querySelector('sound[tempo]');
+                if (tempoElement) {
+                    const tempoValue = parseFloat(tempoElement.getAttribute('tempo'));
+                    setTempo(tempoValue);
+                }
+            } catch (error) {
+                console.error('Error rendering MusicXML:', error);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        if (musicXMLContent) {
+            loadMusicXML(musicXMLContent);
+        }
+
+        return () => {
             if (osmdRef.current) {
                 stopAnimation();
-                osmdRef.current.clear(); //This line was already in the code, but the timing was wrong.
+                osmdRef.current.clear();
                 osmdRef.current = null;
             }
-
-
-            // Initialize OSMD
-            const osmd = new OpenSheetMusicDisplay(osmdContainerRef.current, {
-                backend: 'svg',
-                drawTitle: false,
-                drawPartNames: false,
-            });
-
-            osmdRef.current = osmd;
-
-            await osmd.load(xmlContent);
-            await osmd.render();
-
-
-            // Extract tempo from MusicXML
-            const parser = new DOMParser();
-            const xmlDoc = parser.parseFromString(xmlContent, 'text/xml');
-            const tempoElement = xmlDoc.querySelector('sound[tempo]');
-            if (tempoElement) {
-                const tempoValue = parseFloat(tempoElement.getAttribute('tempo'));
-                setTempo(tempoValue);
-            }
-        } catch (error) {
-            console.error('Error rendering MusicXML:', error);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    if (musicXMLContent) {
-        loadMusicXML(musicXMLContent);
-    }
-
-    return () => {
-        if (osmdRef.current) {
-            stopAnimation();
-            osmdRef.current.clear();
-            osmdRef.current = null;
-        }
-    };
-}, [musicXMLContent]);
-
+        };
+    }, [musicXMLContent]);
 
     const parseMusicXML = (file) => {
         return new Promise((resolve, reject) => {
@@ -172,19 +171,105 @@ const CompareMusicXMLWithAudio = () => {
         return `${notes[noteIndex]}${octave}`;
     };
 
+    // Function to start real-time pitch detection
+    const startRealTimePitchDetection = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            setMicStream(stream);
+
+            const audioContext = audioContextRef.current;
+
+            // Check and resume AudioContext if it's suspended (autoplay policy)
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            const source = audioContext.createMediaStreamSource(stream);
+            const analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048;
+            source.connect(analyser);
+            pitchAnalyserRef.current = analyser;
+
+            const sampleRate = audioContext.sampleRate;
+            const frameSize = 2048;
+            const detector = Pitchy.PitchDetector.forFloat32Array(frameSize);
+            const input = new Float32Array(analyser.fftSize);
+
+            const detectPitch = () => {
+                analyser.getFloatTimeDomainData(input);
+                const [pitch, clarity] = detector.findPitch(input, sampleRate);
+
+                // Debugging logs
+                console.log("Pitch:", pitch, "Clarity:", clarity);  // ADDED
+
+                if (clarity > 0.5 && pitch > 0) {  // Reduced clarity threshold
+                    //  setRealTimePitches((prevPitches) => [...prevPitches, pitch]);
+                    recordedPitchesRef.current = [...recordedPitchesRef.current, pitch];  // Use ref
+                    console.log("Pitches in ref:", recordedPitchesRef.current);  // Log pitches in ref
+
+                }
+            };
+
+            intervalRef.current = setInterval(detectPitch, 50); // Adjust interval as needed
+        } catch (error) {
+            console.error('Error starting real-time pitch detection:', error);
+
+            // More specific error handling
+            if (error.name === 'NotAllowedError') {
+                console.error('Microphone permission denied by user.');
+                alert('Please allow microphone access to use this feature.');
+            } else if (error.name === 'NotFoundError') {
+                console.error('No microphone found.');
+                alert('No microphone detected. Please connect a microphone.');
+            } else {
+                console.error('An error occurred while accessing the microphone:', error);
+                alert('An error occurred while accessing the microphone.');
+            }
+        }
+    };
+
+    // Function to stop real-time pitch detection
+    const stopRealTimePitchDetection = () => {
+        if (intervalRef.current) {
+            clearInterval(intervalRef.current);
+            intervalRef.current = null;
+        }
+
+        if (micStream) {
+            micStream.getTracks().forEach((track) => track.stop());
+            setMicStream(null);
+        }
+
+        pitchAnalyserRef.current = null;
+    };
+
     const handleCompare = async () => {
-        if (!musicXMLFile || !recordedAudio) {
-            alert('Please upload a MusicXML file and record audio.');
+        if (!musicXMLFile) {
+            alert('Please upload a MusicXML file.');
             return;
         }
 
         setIsComparing(true);
-        setTransitionComplete(false); // Reset the transition complete state
-        startAnimation(() => {
-            // Callback function executed when the animation is complete
-            setTransitionComplete(true);
-            performComparison();
+        setTransitionComplete(false);
+        setRealTimePitches([]); // Clear previous real-time pitches
+        recordedPitchesRef.current = [];  // Clear ref
+
+        // Wrap startAnimation in a Promise to handle completion
+        new Promise((resolve) => {
+            startAnimation(() => {
+                // This will be the callback executed at the end of the animation.
+                setTransitionComplete(true);
+                resolve(); // Resolve the promise when animation is complete
+            });
+        }).then(() => {
+            // ADD DELAY HERE
+            setTimeout(() => {
+                performComparison();
+                stopRealTimePitchDetection(); //  stop mic here bcz transition complete
+            }, 500); // Adjust the delay (in milliseconds) as needed (e.g., 500ms)
         });
+
+        startRealTimePitchDetection(); // Start real-time pitch detection when animation starts
     };
 
     const performComparison = async () => {
@@ -192,27 +277,23 @@ const CompareMusicXMLWithAudio = () => {
 
         try {
             const musicXMLNotes = await parseMusicXML(musicXMLFile);
-            const audioPitches = await analyzeAudioFile(recordedAudio);
+            // const audioPitches = await analyzeAudioFile(recordedAudio); // No longer using recorded audio
+            console.log(musicXMLNotes, "musicXMLnotes");
 
-
-      console.log(musicXMLNotes,"musicXMLnotes")
-      console.log("audioPitches",audioPitches)
-
+            // Access pitches from ref
+            const detectedPitches = recordedPitchesRef.current;
+            console.log("realTimePitches from ref:", detectedPitches);
 
             let matchCount = 0;
-            audioPitches.forEach((detectedPitch) => {
+            detectedPitches.forEach((detectedPitch) => {
                 const note = convertFrequencyToNoteName(detectedPitch);
                 if (musicXMLNotes.includes(note)) {
                     matchCount++;
                 }
             });
-// console.log(matchCount,"matched")
-const rawScore = (matchCount / musicXMLNotes.length) * 100;
 
-// Scale down by 10 but cap the maximum value at 100%
-const comparisonScore = Math.min(rawScore / 10, 100);
-
-
+            const rawScore = (matchCount / musicXMLNotes.length) * 100;
+            const comparisonScore = Math.min(rawScore / 10, 100);
 
             setComparisonResult(`Similarity: ${comparisonScore.toFixed(2)}%`);
         } catch (error) {
@@ -239,12 +320,13 @@ const comparisonScore = Math.min(rawScore / 10, 100);
         intervalRef.current = setInterval(() => {
             if (
                 !osmdRef.current.cursor ||
-                !osmdRef.current.cursor.iterator.currentVoiceEntries.length
+                osmdRef.current.cursor.iterator.endReached
             ) {
                 stopAnimation();
                 onAnimationComplete(); // Execute the callback when the animation is complete
                 return;
             }
+
 
             osmdRef.current.cursor.next();
             notesPlayed++;  // Increment the played notes count
@@ -274,73 +356,72 @@ const comparisonScore = Math.min(rawScore / 10, 100);
         if (isPlaying) {
             stopAnimation();
         } else {
-            startAnimation(() => {}); // Empty callback here as we don't need specific action
+            startAnimation(() => { }); // Empty callback here as we don't need specific action
         }
     };
 
     return (
-<div 
-    className="container-fluid bg-dark text-white vh-100 d-flex justify-content-center align-items-center" 
-    style={{ width: "100vw", margin: "0", padding: "0", overflow: "hidden" }}
->
-    <div className="w-75 p-5">
-        <h2 className="mb-4 text-center">Compare MusicXML with Recorded Audio</h2>
+        <div
+            className="container-fluid bg-dark text-white vh-100 d-flex justify-content-center align-items-center"
+            style={{ width: "100vw", margin: "0", padding: "0", overflow: "hidden" }}
+        >
+            <div className="w-75 p-5">
+                <h2 className="mb-4 text-center">Compare MusicXML with Real-time Audio</h2>
 
-        <div className="mb-3">
-            <input
-                type="file"
-                accept=".xml"
-                onChange={handleMusicXMLChange}
-                className="form-control bg-secondary text-white"
-            />
-        </div>
+                <div className="mb-3">
+                    <input
+                        type="file"
+                        accept=".xml"
+                        onChange={handleMusicXMLChange}
+                        className="form-control bg-secondary text-white"
+                    />
+                </div>
 
-        <div ref={osmdContainerRef} className="border rounded p-3 mb-3 bg-secondary" style={{ height: '300px' }}></div>
+                <div ref={osmdContainerRef} className="border rounded p-3 mb-3 bg-secondary" style={{ height: '300px' }}></div>
 
-        <div className="mb-3 text-center">
-            <ReactMic
-                record={isRecording}
-                onStop={onStop}
-                strokeColor="#0000ff"
-                backgroundColor="#f8f8f8"
-            />
-        </div>
+                {/* <div className="mb-3 text-center">
+                    <ReactMic
+                        record={isRecording}
+                        onStop={onStop}
+                        strokeColor="#0000ff"
+                        backgroundColor="#f8f8f8"
+                    />
+                </div>
 
-        <div className="mb-3 text-center">
-            {!isRecording ? (
-                <button onClick={startRecording} className="btn btn-primary">Start Recording</button>
-            ) : (
-                <button onClick={stopRecording} className="btn btn-danger">Stop Recording</button>
-            )}
-            {recordedAudio && <audio controls src={URL.createObjectURL(recordedAudio)} />}
-        </div>
+                <div className="mb-3 text-center">
+                    {!isRecording ? (
+                        <button onClick={startRecording} className="btn btn-primary">Start Recording</button>
+                    ) : (
+                        <button onClick={stopRecording} className="btn btn-danger">Stop Recording</button>
+                    )}
+                    {recordedAudio && <audio controls src={URL.createObjectURL(recordedAudio)} />}
+                </div> */}
 
-        <div className="text-center">
-            <button
-                onClick={handleCompare}
-                disabled={loading || isComparing}
-                className="btn btn-success me-2"
-            >
-                {loading
-                    ? 'Comparing...'
-                    : isComparing
-                        ? 'Transitioning...'
-                        : 'Compare'}
-            </button>
-            {/* <button onClick={togglePlay} disabled={loading || isComparing} className="btn btn-info">
-                {isPlaying ? 'Stop' : 'Play'}
-            </button> */}
-        </div>
+                <div className="text-center">
+                    <button
+                        onClick={handleCompare}
+                        disabled={loading || isComparing}
+                        className="btn btn-success me-2"
+                    >
+                        {loading
+                            ? 'Comparing...'
+                            : isComparing
+                                ? 'Transitioning...'
+                                : 'Compare'}
+                    </button>
+                    {/* <button onClick={togglePlay} disabled={loading || isComparing} className="btn btn-info">
+                        {isPlaying ? 'Stop' : 'Play'}
+                    </button> */}
+                </div>
 
-        {transitionComplete && comparisonResult && (
-            <div className="mt-4 alert alert-secondary text-center">
-                <h3>Comparison Result</h3>
-                <p>{comparisonResult}</p>
+                {transitionComplete && comparisonResult && (
+                    <div className="mt-4 alert alert-secondary text-center">
+                        <h3>Comparison Result</h3>
+                        <p>{comparisonResult}</p>
+                    </div>
+                )}
             </div>
-        )}
-    </div>
-</div>
-
+        </div>
     );
 };
 
